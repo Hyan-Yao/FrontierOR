@@ -77,13 +77,11 @@ OPENROUTER_API_KEY_ONESHOT: sk-or-...
 OPENROUTER_API_KEY_SELF_EVOLVE: sk-or-...   
 ```
 
-You do **not** need this for the Quick Start below, which reuses pre-generated code in `samples/`.
-
 ---
 
 ## 🚀 Quick Start
 
-Run the following command to quickly conduct the one-shot evaluation, with results written to `eval/`. No API key is required, making this the fastest sanity check that the framework is set up correctly.
+Run the following command to quickly conduct the one-shot evaluation, with results written to `eval/`. It reuses pre-generated code in `samples/` so **no API key is required**, making this the fastest sanity check that the framework is set up correctly.
 
 ```bash
 python -u one_shot_eval.py --paper_id bierwirth2017 liao2020 --reuse-code all --code-root samples/oneshot_code --exec-mode bare
@@ -119,7 +117,7 @@ Key flags:
 
 - `--paper_id` — paper IDs.
 - `--models` — model names registered in `configs/oneshot.yaml`. Pass `all` to evaluate every model in the file.
-- `--instances` — instances to evaluater. Put `tiny` first as a sanity gate: stop here if it's not feasible with gap ≤ 10%, before running the computationally expensive large instances.
+- `--instances` — instances to evaluater. Put `tiny` first as a sanity gate, before running the computationally expensive large instances.
 - `--max_debug_retries` — bounded debug loop when the LLM's program raises.
 - `--paper_workers` / `--model_workers` / `--instance_workers` — three-level parallelism across the (paper × model × instance) grid.
 - `--exec-mode` — `bare` / `systemd` / `docker`, paired with `--cpus` / `--memory`. Isolation strength: `bare` only pins CPUs; `systemd` adds cgroup-enforced memory cap + network block; `docker` adds full container isolation (no host filesystem access).

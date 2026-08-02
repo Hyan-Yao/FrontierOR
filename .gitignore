@@ -29,6 +29,18 @@ env/
 # Runtime output (one_shot_eval.py writes per-paper code + CSV here)
 eval/
 
+# Local planning / draft documents
+main.pdf
+merge.md
+one-shot_submission_adapter_examples.md
+participate.md
+self_evolve_submission_adapter_examples.md
+
+# Draft community submission templates
+community/model_submissions/TEMPLATE/
+community/framework_submissions/TEMPLATE/
+community/problem_proposals/TEMPLATE/
+
 # IDE / OS noise
 .vscode/
 .idea/
