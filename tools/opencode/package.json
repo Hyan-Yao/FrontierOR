@@ -1,0 +1,11 @@
+{
+  "name": "frontieror-opencode-runtime",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Pinned repository-local OpenCode runtime for CORAL evaluations",
+  "dependencies": {
+    "@ai-sdk/openai-compatible": "3.0.16",
+    "@opencode-ai/plugin": "1.18.5",
+    "opencode-ai": "1.18.5"
+  }
+}

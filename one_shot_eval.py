@@ -37,6 +37,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import yaml
 
+from scripts.utils.paper_discovery import discover_valid_papers
+
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Directory containing the per-(paper, model) ``code.py`` files to READ from.
@@ -187,23 +189,25 @@ def _load_paper_ids_by_tag(tag):
 
 
 def _load_all_paper_dirs():
-    """Return sorted paper_ids by scanning the data dir for subdirectories.
-    Used when both --paper_id and --paper-tag are omitted."""
-    data_dir = get_data_dir()
-    out = []
-    for name in sorted(os.listdir(data_dir)):
-        if name.startswith("__") or name.startswith("."):
-            continue
-        if os.path.isdir(os.path.join(data_dir, name)):
-            out.append(name)
-    return out
+    """Return only complete, runnable tasks from the benchmark data tree."""
+    return discover_valid_papers(get_data_dir())
 
 
 # Per-paper optimization direction ("min" or "max") from the metadata CSV.
 # Used by compare_objectives and compute_aocc to avoid treating "LLM beats ref"
 # as "LLM is further from ref".
 _DIRECTION_META_PATH = os.path.join(ROOT_DIR, "results", "data_statistics", "paper_meta_info.csv")
+_DIRECTION_META_JSON_PATHS = (
+    os.path.join(ROOT_DIR, "paper_meta_info.json"),
+    os.path.join(ROOT_DIR, "frontier-or", "paper_meta_info.json"),
+)
 _DIRECTIONS_CACHE = None
+
+
+def _direction_registry_label():
+    paths = [_DIRECTION_META_PATH, *_DIRECTION_META_JSON_PATHS]
+    existing = [path for path in paths if os.path.exists(path)]
+    return existing[0] if existing else " or ".join(paths)
 
 
 def _load_directions():
@@ -224,6 +228,18 @@ def _load_directions():
                 d = (row.get("direction") or "").strip().lower()
                 if pid and d in ("min", "max"):
                     out[pid] = d
+    else:
+        for path in _DIRECTION_META_JSON_PATHS:
+            if not os.path.exists(path):
+                continue
+            with open(path, encoding="utf-8") as f:
+                rows = json.load(f)
+            for row in rows:
+                pid = str(row.get("paper_id") or "").strip()
+                d = str(row.get("direction") or "").strip().lower()
+                if pid and d in ("min", "max"):
+                    out[pid] = d
+            break
     _DIRECTIONS_CACHE = out
     return out
 
@@ -241,15 +257,16 @@ def get_paper_direction(paper_id):
     """
     d = _load_directions().get(paper_id)
     if d is None:
-        if not os.path.exists(_DIRECTION_META_PATH):
+        registry = _direction_registry_label()
+        if not any(os.path.exists(path) for path in (_DIRECTION_META_PATH, *_DIRECTION_META_JSON_PATHS)):
             raise ValueError(
                 f"Cannot resolve optimization direction for paper "
                 f"{paper_id!r}: direction registry not found at "
-                f"{_DIRECTION_META_PATH}."
+                f"{registry}."
             )
         raise ValueError(
             f"Cannot resolve optimization direction for paper {paper_id!r}: "
-            f"it has no valid 'min'/'max' row in {_DIRECTION_META_PATH}. "
+            f"it has no valid 'min'/'max' row in {registry}. "
             f"Add one before evaluating -- a missing direction silently "
             f"inverts the paper's quality/QTE scores."
         )
@@ -264,9 +281,9 @@ def validate_paper_directions(paper_ids):
     upfront instead of part-way through (or, worse, silently). Call this
     before doing any evaluation work.
     """
-    if not os.path.exists(_DIRECTION_META_PATH):
+    if not any(os.path.exists(path) for path in (_DIRECTION_META_PATH, *_DIRECTION_META_JSON_PATHS)):
         raise ValueError(
-            f"Direction registry not found at {_DIRECTION_META_PATH}; "
+            f"Direction registry not found at {_direction_registry_label()}; "
             f"cannot evaluate any paper without it."
         )
     directions = _load_directions()
@@ -274,7 +291,7 @@ def validate_paper_directions(paper_ids):
     if missing:
         raise ValueError(
             f"{len(missing)} paper(s) have no valid 'min'/'max' direction in "
-            f"{_DIRECTION_META_PATH}: {missing}. Add them before evaluating "
+            f"{_direction_registry_label()}: {missing}. Add them before evaluating "
             f"-- a missing direction silently inverts quality/QTE scores and "
             f"steers self-evolving search toward the worst solutions."
         )
@@ -382,11 +399,31 @@ def load_config():
     if os.path.exists(keys_path):
         with open(keys_path, "r") as f:
             keys = yaml.safe_load(f) or {}
-    api_key = os.environ.get("OPENROUTER_API_KEY") or keys.get("OPENROUTER_API_KEY_ONESHOT")
-    if not api_key:
-        print("ERROR: set env OPENROUTER_API_KEY or OPENROUTER_API_KEY_ONESHOT in configs/api_keys.yaml")
+    openai_key = os.environ.get("OPENAI_API_KEY")
+    openrouter_key = (
+        os.environ.get("OPENROUTER_API_KEY")
+        or keys.get("OPENROUTER_API_KEY_ONESHOT")
+    )
+    if openai_key:
+        config["LLM_API_PROVIDER"] = "openai_compatible"
+        config["LLM_API_KEY"] = openai_key
+        config["LLM_API_BASE"] = (
+            os.environ.get("OPENAI_BASE_URL")
+            or os.environ.get("OPENAI_API_BASE")
+            or "https://api.openai.com/v1"
+        )
+        config["OPENAI_API_KEY"] = openai_key
+    elif openrouter_key:
+        config["LLM_API_PROVIDER"] = "openrouter"
+        config["LLM_API_KEY"] = openrouter_key
+        config["LLM_API_BASE"] = "https://openrouter.ai/api/v1"
+        config["OPENROUTER_API_KEY"] = openrouter_key
+    else:
+        print(
+            "ERROR: set OPENAI_API_KEY, OPENROUTER_API_KEY, or "
+            "OPENROUTER_API_KEY_ONESHOT in configs/api_keys.yaml"
+        )
         sys.exit(1)
-    config["OPENROUTER_API_KEY"] = api_key
     if not config.get("models"):
         if config.get("model"):
             config["models"] = [config["model"]]
@@ -486,12 +523,43 @@ def load_model_pricing():
 MODEL_PRICING = load_model_pricing()
 
 
-def _resolve_openrouter_api_key(config, model):
-    return config["OPENROUTER_API_KEY"]
+def _resolve_llm_api_key(config, model):
+    del model
+    key = (
+        config.get("LLM_API_KEY")
+        or config.get("OPENAI_API_KEY")
+        or config.get("OPENROUTER_API_KEY")
+    )
+    if not key:
+        raise KeyError("No LLM API key configured")
+    return key
+
+
+def _chat_completions_url(config):
+    base = (
+        config.get("LLM_API_BASE")
+        or os.environ.get("OPENAI_BASE_URL")
+        or os.environ.get("OPENAI_API_BASE")
+        or "https://openrouter.ai/api/v1"
+    )
+    return f"{str(base).rstrip('/')}/chat/completions"
+
+
+def _endpoint_model_id(config, model):
+    """Map configured routes to the model ID expected by the endpoint.
+
+    OpenRouter uses vendor-prefixed routes.  A custom OpenAI-compatible Qwen
+    endpoint expects its native model ID and rejects ``qwen/``.
+    """
+    if config.get("LLM_API_PROVIDER") == "openrouter":
+        return model
+    if str(model).startswith("qwen/"):
+        return str(model).split("/", 1)[1]
+    return model
 
 
 def call_openrouter(messages, config, model, temperature=None):
-    """Call OpenRouter chat completions API.
+    """Call an OpenAI-compatible chat completions API.
     Returns (content, usage_dict) where usage_dict has prompt_tokens, completion_tokens.
 
     Raises ValueError if the response carries no usable text (neither 'content'
@@ -503,20 +571,21 @@ def call_openrouter(messages, config, model, temperature=None):
     its default avoids capping reasoning-model budgets too low (gemini
     breakage mode) while the ``content`` → ``reasoning`` fallback already
     handles providers that deliver nothing in ``content``."""
-    url = "https://openrouter.ai/api/v1/chat/completions"
+    url = _chat_completions_url(config)
+    endpoint_model = _endpoint_model_id(config, model)
     headers = {
-        "Authorization": f"Bearer {_resolve_openrouter_api_key(config, model)}",
+        "Authorization": f"Bearer {_resolve_llm_api_key(config, model)}",
         "Content-Type": "application/json",
     }
     payload = {
-        "model": model,
+        "model": endpoint_model,
         "messages": messages,
     }
     if temperature is not None:
         payload["temperature"] = temperature
     resp = requests.post(url, headers=headers, json=payload, timeout=300)
     if resp.status_code >= 400:
-        print(f"  [call_openrouter] HTTP {resp.status_code} body: {resp.text[:800]}")
+        print(f"  [llm-api] HTTP {resp.status_code} body: {resp.text[:800]}")
     resp.raise_for_status()
     data = resp.json()
     msg = data["choices"][0]["message"]
@@ -2358,14 +2427,18 @@ def main():
                              "Pass 'all' (i.e. --models all) as an alias for every configured model. "
                              "If omitted, all models in config are used.")
     parser.add_argument("--exec-mode", type=str, default="systemd",
-                        choices=["bare", "systemd", "docker"],
+                        choices=["bare", "bubblewrap", "systemd", "docker"],
                         help="Execution backend: bare (no CPU limits — debug only!), "
                              "systemd (default; cgroup + taskset pinning to --cpus cores), "
                              "docker (full container isolation).")
     parser.add_argument("--cpus", type=int, default=1,
                         help="CPU cores for systemd/docker execution (default: 1).")
-    parser.add_argument("--memory", type=str, default="640G",
-                        help="Memory limit for systemd/docker execution (default: 640G).")
+    parser.add_argument("--memory", type=str, default="16G",
+                        help="Per-candidate memory limit (default: 16G). Bubblewrap uses "
+                             "RLIMIT_AS; systemd/docker use cgroup/container limits.")
+    parser.add_argument("--memory-reserve", type=str, default="16G",
+                        help="Bubblewrap admission guard: host MemAvailable kept unreserved "
+                             "for other programs (default: 16G; 0 disables the reserve).")
     parser.add_argument("--t_max", type=parse_t_max, default=None,
                         help="Custom time horizon for AOCC computation. "
                              "Accepts a positive float (seconds, global) or the "
@@ -2480,7 +2553,11 @@ def main():
     print(f"Data dir: {get_data_dir()}")
     print(f"GRB_LICENSE_FILE: {gurobi_license or os.environ.get('GRB_LICENSE_FILE') or '<not set>'}")
     exec_mode = args.exec_mode
-    exec_cfg = {"cpus": args.cpus, "memory": args.memory}
+    exec_cfg = {
+        "cpus": args.cpus,
+        "memory": args.memory,
+        "memory_reserve": args.memory_reserve,
+    }
     t_max = args.t_max
     reuse_code = args.reuse_code
     set_instance_workers(args.instance_workers)
@@ -2489,7 +2566,10 @@ def main():
           f"Time limit: {args.time_limit}s, "
           f"Paper workers: {args.paper_workers}, Model workers: {args.model_workers}, "
           f"Instance workers: {args.instance_workers}")
-    print(f"Exec: {exec_mode} (mem={args.memory}), T_max: {t_max or 'time_limit'}")
+    print(
+        f"Exec: {exec_mode} (mem={args.memory}, reserve={args.memory_reserve}), "
+        f"T_max: {t_max or 'time_limit'}"
+    )
     if reuse_code == "all":
         print("Mode: REUSE-CODE=all (reuse code.py on disk; "
               "fresh init-gen where missing; run all --instances)")

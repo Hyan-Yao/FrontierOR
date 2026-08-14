@@ -56,9 +56,17 @@ def chat_completions_path(endpoint: Optional[str]) -> str:
 
 def prepare_eoh_env(base_env: Optional[Dict[str, str]], config: Dict) -> Dict[str, str]:
     env = dict(base_env or os.environ)
-    key = env.get("OPENROUTER_API_KEY") or config.get("OPENROUTER_API_KEY")
+    provider = config.get("LLM_API_PROVIDER", "openrouter")
+    key = (
+        config.get("LLM_API_KEY")
+        or env.get("OPENAI_API_KEY")
+        or env.get("OPENROUTER_API_KEY")
+        or config.get("OPENROUTER_API_KEY")
+    )
     if key:
-        env["OPENROUTER_API_KEY"] = key
+        env["OPENAI_API_KEY"] = key
+        if provider == "openrouter":
+            env["OPENROUTER_API_KEY"] = key
     if os.environ.get("GRB_LICENSE_FILE"):
         env["GRB_LICENSE_FILE"] = os.environ["GRB_LICENSE_FILE"]
     return env
@@ -92,7 +100,7 @@ _EOH_SYSTEM_USER_SEP = "\n<<<__EOH_SYSTEM_USER_SEP__>>>\n"
 
 
 def patch_eoh_remote_api_path():
-    """Make upstream EoH's remote API client work with OpenRouter's /api/v1 path."""
+    """Route EoH through Chat Completions or OpenAI's Responses API."""
     try:
         from eoh.llm import api_general
     except Exception:
@@ -115,11 +123,25 @@ def patch_eoh_remote_api_path():
             ]
         else:
             messages = [{"role": "user", "content": prompt_content}]
-        payload = json.dumps({
-            "model": self.model_LLM,
-            "messages": messages,
-            "temperature": temperature,
-        })
+        endpoint_host = _endpoint_host(self.api_endpoint)
+        model_id = str(self.model_LLM).split("/", 1)[-1]
+        use_responses_api = (
+            endpoint_host == "api.openai.com" and model_id == "gpt-5.3-codex"
+        )
+        payload_data = {"model": model_id}
+        if use_responses_api:
+            payload_data["input"] = messages
+        else:
+            payload_data["messages"] = messages
+        # OpenAI reasoning models reject temperature/top_p. Keep EoH aligned
+        # with OpenEvolve's full-rewrite ceiling while preserving temperature
+        # for non-reasoning and OpenRouter-hosted models.
+        if model_id.lower().startswith(("gpt-5", "o1", "o3", "o4")):
+            token_key = "max_output_tokens" if use_responses_api else "max_completion_tokens"
+            payload_data[token_key] = 32768
+        else:
+            payload_data["temperature"] = temperature
+        payload = json.dumps(payload_data)
         headers = {
             "Authorization": "Bearer " + self.api_key,
             "User-Agent": "frontier-or/1.0",
@@ -131,13 +153,21 @@ def patch_eoh_remote_api_path():
                 conn = http.client.HTTPSConnection(_endpoint_host(self.api_endpoint))
                 conn.request(
                     "POST",
-                    chat_completions_path(self.api_endpoint),
+                    "/v1/responses" if use_responses_api else chat_completions_path(self.api_endpoint),
                     payload,
                     headers,
                 )
                 data = json.loads(conn.getresponse().read())
-                message = data["choices"][0]["message"]
-                response = message.get("content") or message.get("reasoning")
+                if use_responses_api:
+                    text_parts = []
+                    for item in data.get("output", []):
+                        for content in item.get("content", []):
+                            if content.get("type") == "output_text" and content.get("text"):
+                                text_parts.append(content["text"])
+                    response = "\n".join(text_parts)
+                else:
+                    message = data["choices"][0]["message"]
+                    response = message.get("content") or message.get("reasoning")
                 if response:
                     break
             except Exception:
@@ -542,10 +572,8 @@ def patch_eoh_i1_with_oneshot_seed(
     Path lookup matches OpenEvolve's helper (``_try_reuse_oneshot_seed``):
     ``eval/eval_papers/<paper>/<model_short>/code_attempt0.py``.
     """
-    src = os.path.join(
-        ROOT_DIR, "eval", "eval_papers", paper_id, model_short, "code_attempt0.py",
-    )
-    if not os.path.exists(src) or os.path.getsize(src) == 0:
+    src = eval_modes.latest_oneshot_attempt(paper_id, model_short)
+    if src is None:
         return False
 
     seed_dir = os.path.join(output_dir, "seed_oneshot")
@@ -653,15 +681,18 @@ def run_eoh(
 
     llm_cfg = (config.get("eoh") or {}).get("llm", {})
     api_key = (
-        os.environ.get("OPENROUTER_API_KEY")
+        config.get("LLM_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+        or os.environ.get("OPENROUTER_API_KEY")
         or config.get("OPENROUTER_API_KEY")
         or llm_cfg.get("api_key")
     )
     if not api_key:
-        raise RuntimeError("OPENROUTER_API_KEY is required for EoH runs.")
+        raise RuntimeError("An OpenAI or OpenRouter API key is required for EoH runs.")
 
     api_endpoint = _endpoint_host(
-        llm_cfg.get("api_endpoint")
+        config.get("LLM_API_BASE")
+        or llm_cfg.get("api_endpoint")
         or config.get("OPENROUTER_API_ENDPOINT")
         or config.get("OPENROUTER_BASE_URL")
         or "openrouter.ai"
@@ -844,21 +875,35 @@ def run_self_evolve(
         enable_artifact=enable_artifact,
     )
 
-    env = prepare_eoh_env(os.environ, merged_config)
-    with patched_env(env):
-        run_eoh(
-            problem=problem,
-            output_dir=eoh_run_dir,
-            primary_model=primary_model,
-            config=merged_config,
-            pop_size=pop_size,
-            n_pop=n_pop,
-            workers=workers,
-            timeout=timeout,
-            operators=operators,
-            system_include_spec=system_include_spec,
-            resume=resume,
-        )
+    evolution_complete = False
+    if resume:
+        try:
+            existing_best = find_best_eoh_individual(eoh_run_dir)
+            evolution_complete = int(existing_best.get("_generation", 0)) >= int(n_pop)
+        except (FileNotFoundError, RuntimeError, ValueError, TypeError):
+            evolution_complete = False
+        if evolution_complete:
+            print(
+                f"[resume:eoh] generation {existing_best.get('_generation')} already "
+                f"meets target {n_pop}; skipping evolution and continuing final evaluation"
+            )
+
+    if not evolution_complete:
+        env = prepare_eoh_env(os.environ, merged_config)
+        with patched_env(env):
+            run_eoh(
+                problem=problem,
+                output_dir=eoh_run_dir,
+                primary_model=primary_model,
+                config=merged_config,
+                pop_size=pop_size,
+                n_pop=n_pop,
+                workers=workers,
+                timeout=timeout,
+                operators=operators,
+                system_include_spec=system_include_spec,
+                resume=resume,
+            )
 
     best = find_best_eoh_individual(eoh_run_dir)
     best_program_path = materialize_candidate(
@@ -866,7 +911,28 @@ def run_self_evolve(
         os.path.join(base_dir, "best", "best_program.py"),
     )
 
-    if final_instances:
+    cached = problem.read_cached_metrics(best["code"])
+    stage1_metrics = (cached or {}).get("stage1_metrics") or {}
+    failed_tiny_gate = stage1_metrics.get("stage1_passed") == 0.0
+
+    if final_instances and failed_tiny_gate:
+        final_results = {
+            inst: {
+                "status": "fail",
+                "fail_reason": "tiny_gate_failed",
+                "feasible": False,
+                "gap": None,
+                "solve_time": None,
+                "llm_obj": None,
+                "gurobi_obj": None,
+                "aocc": None,
+                "error": "Selected EoH program failed the mandatory tiny gate; held-out execution skipped.",
+                "retries": 0,
+            }
+            for inst in final_instances
+        }
+        print("[final:eoh] selected program failed tiny gate; skipping held-out execution")
+    elif final_instances:
         final_results = eval_modes.evaluate_best_on_test_set(
             paper_id, model_name, best_program_path, final_instances,
             test_time_limit, test_time_policy, test_time_buffer,
@@ -892,7 +958,6 @@ def run_self_evolve(
     # iteration_found = best individual's generation number (each EoH
     # generation evolves the whole population); generation (lineage depth)
     # is left blank since EoH individuals don't store parent_id in saved JSON.
-    cached = problem.read_cached_metrics(best["code"])
     stage2_metrics = (cached or {}).get("stage2_metrics") or {}
     if stage2_metrics:
         dev_results_for_csv = reconstruct_results_from_metrics(

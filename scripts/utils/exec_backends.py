@@ -5,6 +5,7 @@ Three modes:
   - "bare":        Direct subprocess, no resource limits (default, for debugging)
   - "systemd":     systemd-run with CPU/memory cgroups (lightweight, Linux only)
   - "docker":      Docker container with resource limits (fully isolated, reproducible)
+  - "bubblewrap":  Filesystem/env isolation for hosts without user-systemd/Docker
 
 All backends share the same interface:
     (success, output, elapsed) = run(code_path, instance_path, solution_path,
@@ -12,7 +13,10 @@ All backends share the same interface:
 """
 
 import contextlib
+import fcntl
+import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -20,11 +24,130 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 
 # Default resource limits
 DEFAULT_CPUS = 1          # number of CPU cores
-DEFAULT_MEMORY = "32G"    # memory limit (uppercase for systemd compatibility)
+DEFAULT_MEMORY = "16G"    # per-candidate address-space / cgroup cap
+DEFAULT_MEMORY_RESERVE = "16G"  # host MemAvailable kept free at admission time
 DEFAULT_DOCKER_IMAGE = "frontier-or"
+_MEMORY_LOCK_PATH = "/tmp/frontieror_memory_admission.lock"
+_MEMORY_STATE_PATH = "/tmp/frontieror_memory_admission.json"
+
+
+def parse_memory_bytes(value):
+    """Parse Docker/systemd-style memory sizes (e.g. ``16G`` or ``512MiB``)."""
+    if isinstance(value, bool):
+        raise ValueError("memory limit must be a byte count or size string")
+    if isinstance(value, int):
+        if value <= 0:
+            raise ValueError("memory limit must be positive")
+        return value
+    text = str(value).strip()
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*([KMGTPE]?)(?:i?[bB])?", text, re.I)
+    if not match:
+        raise ValueError(f"invalid memory size: {value!r}")
+    number = float(match.group(1))
+    unit = match.group(2).upper()
+    exponent = "KMGTPE".find(unit) + 1 if unit else 0
+    result = int(number * (1024 ** exponent))
+    if result <= 0:
+        raise ValueError("memory limit must be positive")
+    return result
+
+
+def _mem_available_bytes():
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _process_start_ticks(pid):
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as handle:
+            return handle.read().split()[21]
+    except (OSError, IndexError):
+        return None
+
+
+@contextlib.contextmanager
+def _memory_admission(memory_bytes, reserve_bytes):
+    """Reserve candidate capacity across concurrent FrontierOR processes.
+
+    This admission guard is intentionally conservative: active reservations are
+    subtracted from the current ``MemAvailable`` value even when a candidate has
+    not consumed its full limit yet.  It protects unrelated host workloads from
+    a burst of paper/candidate workers all passing an independent free-memory
+    check at the same time.
+    """
+    token = uuid.uuid4().hex
+    pid = os.getpid()
+    start_ticks = _process_start_ticks(pid)
+    lock_fd = os.open(_MEMORY_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
+    admitted = False
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            with open(_MEMORY_STATE_PATH, encoding="utf-8") as handle:
+                state = json.load(handle)
+        except (OSError, ValueError, TypeError):
+            state = []
+
+        live = []
+        for item in state if isinstance(state, list) else []:
+            try:
+                item_pid = int(item["pid"])
+                item_bytes = int(item["bytes"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if _process_start_ticks(item_pid) == str(item.get("start_ticks")):
+                live.append({**item, "bytes": item_bytes})
+
+        available = _mem_available_bytes()
+        reserved = sum(item["bytes"] for item in live)
+        required = reserved + memory_bytes + reserve_bytes
+        if available is not None and required > available:
+            raise RuntimeError(
+                "memory admission denied: "
+                f"MemAvailable={available // (1024 ** 2)}MiB, "
+                f"active_reservations={reserved // (1024 ** 2)}MiB, "
+                f"candidate_limit={memory_bytes // (1024 ** 2)}MiB, "
+                f"host_reserve={reserve_bytes // (1024 ** 2)}MiB"
+            )
+
+        live.append({
+            "token": token,
+            "pid": pid,
+            "start_ticks": start_ticks,
+            "bytes": memory_bytes,
+            "created": time.time(),
+        })
+        with open(_MEMORY_STATE_PATH, "w", encoding="utf-8") as handle:
+            json.dump(live, handle)
+        os.chmod(_MEMORY_STATE_PATH, 0o600)
+        admitted = True
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+
+        yield
+    finally:
+        if admitted:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            try:
+                with open(_MEMORY_STATE_PATH, encoding="utf-8") as handle:
+                    state = json.load(handle)
+            except (OSError, ValueError, TypeError):
+                state = []
+            state = [item for item in state if item.get("token") != token]
+            with open(_MEMORY_STATE_PATH, "w", encoding="utf-8") as handle:
+                json.dump(state, handle)
+            os.chmod(_MEMORY_STATE_PATH, 0o600)
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
 
 
 @contextlib.contextmanager
@@ -256,6 +379,128 @@ def run_docker(code_path, instance_path, solution_path, time_limit,
     return _exec(cmd, time_limit)
 
 
+def bubblewrap_network_isolation_available():
+    if shutil.which("bwrap") is None:
+        return False
+    probe = subprocess.run(
+        ["bwrap", "--ro-bind", "/", "/", "--unshare-net", "/bin/true"],
+        capture_output=True, text=True, check=False,
+    )
+    return probe.returncode == 0
+
+
+def run_bubblewrap(code_path, instance_path, solution_path, time_limit,
+                   log_path=None, cfg=None):
+    """Run a candidate with filesystem isolation and a fail-closed RAM cap.
+
+    This backend is intended for workstations where user-systemd is unavailable
+    and the benchmark Docker image is not installed.  It exposes only the
+    project virtualenv, candidate directory, one instance, and its output
+    directory.  Network unsharing is best-effort because some kernels disable
+    unprivileged network namespaces; the empty environment and hidden ``/home``
+    still prevent API credentials and Codex auth files from reaching candidates.
+
+    Memory is enforced with inherited ``RLIMIT_AS`` via ``prlimit``.  Unlike a
+    cgroup this is a per-process virtual-address-space limit, but it reliably
+    constrains the single-process Python/Gurobi solvers required by this
+    benchmark.  A cross-process admission ledger also preserves host headroom
+    when multiple paper workers start candidates concurrently.
+    """
+    if shutil.which("bwrap") is None:
+        return False, "bubblewrap executable not found", 0.0
+    if shutil.which("prlimit") is None:
+        return False, "prlimit executable not found; refusing unbounded bubblewrap run", 0.0
+
+    cfg = cfg or {}
+    cpus = cfg.get("cpus", DEFAULT_CPUS)
+    try:
+        memory_bytes = parse_memory_bytes(cfg.get("memory", DEFAULT_MEMORY))
+        reserve_raw = cfg.get("memory_reserve", DEFAULT_MEMORY_RESERVE)
+        reserve_bytes = 0 if str(reserve_raw).strip().upper() in {"0", "0B"} else parse_memory_bytes(reserve_raw)
+    except ValueError as exc:
+        return False, f"invalid bubblewrap memory configuration: {exc}", 0.0
+    core_set = _allocate_cores(cpus)
+    _ensure_logger(code_path)
+
+    code_path = os.path.abspath(code_path)
+    code_dir = os.path.dirname(code_path)
+    instance_path = os.path.abspath(instance_path)
+    solution_path = os.path.abspath(solution_path)
+    output_dir = os.path.dirname(solution_path)
+    os.makedirs(output_dir, exist_ok=True)
+
+    can_unshare_network = bubblewrap_network_isolation_available()
+
+    venv_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".venv"))
+    base_python = os.path.realpath(os.path.join(venv_dir, "bin", "python"))
+    base_python_root = os.path.dirname(os.path.dirname(base_python))
+    command = [
+        "bwrap", "--die-with-parent", "--new-session",
+        "--ro-bind", "/", "/",
+        "--dev", "/dev", "--proc", "/proc",
+        "--tmpfs", "/tmp", "--tmpfs", "/home",
+        "--dir", "/tmp/home",
+        "--dir", os.path.dirname(base_python_root),
+        "--dir", base_python_root,
+        "--ro-bind", base_python_root, base_python_root,
+        "--dir", "/tmp/frontieror-venv",
+        "--ro-bind", venv_dir, "/tmp/frontieror-venv",
+        "--dir", "/tmp/workspace",
+        "--ro-bind", code_dir, "/tmp/workspace/code",
+        "--ro-bind", instance_path, "/tmp/workspace/instance.json",
+        "--bind", output_dir, "/tmp/workspace/output",
+        "--clearenv",
+        "--setenv", "HOME", "/tmp/home",
+        "--setenv", "PATH", "/tmp/frontieror-venv/bin:/usr/bin:/bin",
+        "--setenv", "VIRTUAL_ENV", "/tmp/frontieror-venv",
+        "--setenv", "PYTHONDONTWRITEBYTECODE", "1",
+        "--setenv", "OMP_NUM_THREADS", "1",
+        "--setenv", "OPENBLAS_NUM_THREADS", "1",
+        "--setenv", "MKL_NUM_THREADS", "1",
+        "--setenv", "NUMEXPR_NUM_THREADS", "1",
+        "--chdir", "/tmp/workspace",
+    ]
+    if can_unshare_network:
+        command.insert(3, "--unshare-net")
+
+    license_path = os.environ.get("GRB_LICENSE_FILE")
+    if license_path and os.path.isfile(license_path):
+        command += [
+            "--dir", "/tmp/gurobi",
+            "--ro-bind", os.path.abspath(license_path), "/tmp/gurobi/gurobi.lic",
+            "--setenv", "GRB_LICENSE_FILE", "/tmp/gurobi/gurobi.lic",
+        ]
+
+    inner = [
+        "prlimit",
+        f"--as={memory_bytes}:{memory_bytes}",
+        "--core=0:0",
+        "--nofile=1024:1024",
+        "--",
+        "/tmp/frontieror-venv/bin/python",
+        f"/tmp/workspace/code/{os.path.basename(code_path)}",
+    ] + _build_args(
+        code_path,
+        "/tmp/workspace/instance.json",
+        f"/tmp/workspace/output/{os.path.basename(solution_path)}",
+        time_limit,
+        f"/tmp/workspace/output/{os.path.basename(log_path)}" if log_path else None,
+    )
+    if core_set:
+        python_index = inner.index("/tmp/frontieror-venv/bin/python")
+        inner[python_index:python_index] = ["taskset", "-c", core_set]
+    try:
+        with _memory_admission(memory_bytes, reserve_bytes):
+            success, output, elapsed = _exec(command + inner, time_limit)
+    except RuntimeError as exc:
+        return False, str(exc), 0.0
+    if not success and any(marker in output.lower() for marker in (
+        "memoryerror", "out of memory", "cannot allocate memory", "std::bad_alloc",
+    )):
+        output = f"Candidate exceeded or could not operate within memory limit {memory_bytes} bytes:\n{output}"
+    return success, output, elapsed
+
+
 def _ensure_logger(code_path):
     """Copy solution_logger.py next to the generated code if not already there."""
     code_dir = os.path.dirname(os.path.abspath(code_path))
@@ -330,6 +575,7 @@ BACKENDS = {
     "bare": run_bare,
     "systemd": run_systemd,
     "docker": run_docker,
+    "bubblewrap": run_bubblewrap,
 }
 
 BUILDERS = {

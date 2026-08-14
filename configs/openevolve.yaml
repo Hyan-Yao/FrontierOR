@@ -58,7 +58,7 @@ prompt:
   template_dir: openevolve_templates         # override top_program.txt to drop "Key features:" line
 evaluator:
   timeout: 3600
-  parallel_evaluations: 2    # candidate-level concurrency: 2 children per generation evaluated in parallel; with paper-workers ≤ 15 keeps Gurobi tokens ≤ 30 (well under 100 cap)
+  parallel_evaluations: 1    # memory-safe workstation default; raise only on a dedicated cgroup-protected server
   cascade_evaluation: true
   cascade_thresholds: [0.5]
 # Bounded patience guard against score=0 dead-loops; with parallel_evaluations=1 this means

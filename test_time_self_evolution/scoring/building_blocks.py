@@ -213,16 +213,20 @@ def pick_median_tau_g_instance(paper_id: str) -> Optional[str]:
     representative dev instance (avoids the worst-case bottleneck of always
     picking the slowest one). For odd-count, returns the strict middle; for
     even-count, returns the lower of the two middle τ_g values (favoring
-    faster wall-time over the upper-half one). Returns ``None`` iff no
-    large instance has a recorded τ_g.
+    faster wall-time over the upper-half one). If the paper has large
+    instances but no recorded τ_g values at all, fall back deterministically
+    to the lower median by instance number. This keeps full-dataset runs
+    usable without pretending that the fallback is a measured time median.
+    Returns ``None`` only when no large instance exists on disk.
     """
+    instances = list_large_instances(paper_id)
     timed: List[Tuple[float, str]] = []
-    for inst in list_large_instances(paper_id):
+    for inst in instances:
         tau_g = lookup_gurobi_time(paper_id, inst)
         if tau_g is not None:
             timed.append((float(tau_g), inst))
     if not timed:
-        return None
+        return instances[(len(instances) - 1) // 2] if instances else None
     timed.sort()  # ascending by τ_g
     n = len(timed)
     # Lower median for even n (favors faster wall-time); strict middle for odd

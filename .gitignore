@@ -23,11 +23,15 @@ _publish_staging/
 .venv/
 venv/
 env/
+.tools/
+node_modules/
+external/
 .env
 .env.local
 
 # Runtime output (one_shot_eval.py writes per-paper code + CSV here)
 eval/
+codex_harness/runs/
 
 # Local planning / draft documents
 main.pdf

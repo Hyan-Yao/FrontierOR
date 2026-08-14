@@ -1,3 +1,5 @@
+https://frontieror.vercel.app/data/tasks/adulyasak2015/details.json
+
 # <img src="figures/frontieror_logo.svg" alt="FrontierOR logo" height="40" valign="middle"> FrontierOR: Benchmarking LLMs' Capacity for Efficient Algorithm Design in Large-Scale Optimization
 
 <p align="center">

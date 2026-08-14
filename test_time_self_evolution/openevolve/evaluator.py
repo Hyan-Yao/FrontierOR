@@ -432,7 +432,8 @@ def _common_env():
         t_max = float(t_max_raw)
     exec_cfg = {
         "cpus": int(os.environ.get("EFFICIENT_OR_EXEC_CPUS", "1")),
-        "memory": os.environ.get("EFFICIENT_OR_EXEC_MEMORY", "32G"),
+        "memory": os.environ.get("EFFICIENT_OR_EXEC_MEMORY", "16G"),
+        "memory_reserve": os.environ.get("EFFICIENT_OR_EXEC_MEMORY_RESERVE", "16G"),
     }
     return paper_id, model_name, exec_mode, base_output, t_max, exec_cfg
 

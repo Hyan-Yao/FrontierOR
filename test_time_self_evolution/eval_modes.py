@@ -14,6 +14,7 @@ import shutil
 from typing import Dict, Iterable, List, Optional
 
 import one_shot_eval as eval_core
+from scripts.utils.paper_discovery import discover_valid_papers
 
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -32,13 +33,7 @@ MODE_API_COST_COLUMNS = [
 
 
 def discover_papers(data_dir: str) -> List[str]:
-    if not os.path.isdir(data_dir):
-        return []
-    return sorted(
-        name
-        for name in os.listdir(data_dir)
-        if os.path.isdir(os.path.join(data_dir, name))
-    )
+    return discover_valid_papers(data_dir)
 
 
 def _safe_float(value, default=math.inf):
@@ -130,6 +125,32 @@ def mode_run_dir(run_id: str, mode: str, paper_id: str, model_name: str) -> str:
     wrote them.
     """
     return os.path.join(ROOT_DIR, "eval", mode, run_id, paper_id, model_name)
+
+
+def latest_oneshot_attempt(paper_id: str, model_name: str) -> Optional[str]:
+    """Return the newest one-shot attempt-0 program for a paper/model.
+
+    Older runs wrote directly to ``eval/eval_papers``.  The multi-mode runner
+    now writes run-scoped artifacts under ``eval/one_shot/<run-id>``.  Self-
+    evolution frameworks must search both layouts or they silently generate
+    a different seed, invalidating an apples-to-apples framework comparison.
+    """
+    short = eval_core.get_model_short_name(model_name)
+    candidates = [
+        os.path.join(
+            ROOT_DIR, "eval", "eval_papers", paper_id, short,
+            "code_attempt0.py",
+        )
+    ]
+    candidates.extend(glob.glob(os.path.join(
+        ROOT_DIR, "eval", "one_shot", "*", paper_id, short,
+        "candidate_0", "code_attempt0.py",
+    )))
+    candidates = [
+        path for path in candidates
+        if os.path.isfile(path) and os.path.getsize(path) > 0
+    ]
+    return max(candidates, key=os.path.getmtime) if candidates else None
 
 
 def append_csv_row(csv_path: str, fieldnames: List[str], row: Dict):
@@ -614,5 +635,3 @@ def run_best_of_k(
         "results": final_results,
         "code_path": selected_code or selected_code_path,
     }
-
-

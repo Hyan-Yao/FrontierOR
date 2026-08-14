@@ -32,10 +32,20 @@ OPENEVOLVE_BASE_CONFIG_PATH = os.path.join(ROOT_DIR, "configs", "openevolve.yaml
 
 def prepare_openevolve_env(base_env: Optional[Dict[str, str]], config: Dict) -> Dict[str, str]:
     env = dict(base_env or os.environ)
-    key = env.get("OPENROUTER_API_KEY") or config.get("OPENROUTER_API_KEY")
+    provider = config.get("LLM_API_PROVIDER", "openrouter")
+    key = (
+        config.get("LLM_API_KEY")
+        or env.get("OPENAI_API_KEY")
+        or env.get("OPENROUTER_API_KEY")
+        or config.get("OPENROUTER_API_KEY")
+    )
     if key:
-        env["OPENROUTER_API_KEY"] = key
         env["OPENAI_API_KEY"] = key
+        if provider == "openrouter":
+            env["OPENROUTER_API_KEY"] = key
+    api_base = config.get("LLM_API_BASE")
+    if api_base:
+        env["OPENAI_API_BASE"] = api_base
     if os.environ.get("GRB_LICENSE_FILE"):
         env["GRB_LICENSE_FILE"] = os.environ["GRB_LICENSE_FILE"]
     # Force the subprocess to import openevolve from external/openevolve/ (the
@@ -72,7 +82,12 @@ def find_best_openevolve_program(run_dir: str, fallback_path: str) -> str:
     return candidates[0]
 
 
-def write_openevolve_config(config_path: str, primary_model: str, secondary_model: Optional[str] = None):
+def write_openevolve_config(
+    config_path: str,
+    primary_model: str,
+    secondary_model: Optional[str] = None,
+    api_base: Optional[str] = None,
+):
     """Load configs/openevolve.yaml as base and inject primary/secondary model fields.
 
     Also resolves any relative ``prompt.template_dir`` against the SOURCE
@@ -91,6 +106,8 @@ def write_openevolve_config(config_path: str, primary_model: str, secondary_mode
     llm = base.setdefault("llm", {})
     llm["primary_model"] = primary_model
     llm["secondary_model"] = secondary_model
+    if api_base:
+        llm["api_base"] = api_base
     prompt_block = base.get("prompt") or {}
     tpl_dir = prompt_block.get("template_dir")
     if tpl_dir and not os.path.isabs(tpl_dir):
@@ -289,10 +306,8 @@ def _try_reuse_oneshot_seed(paper_id: str, model_name: str, seed_dir: str) -> Op
     run with the same model has already populated eval_papers/.
     """
     short = eval_core.get_model_short_name(model_name)
-    src = os.path.join(
-        ROOT_DIR, "eval", "eval_papers", paper_id, short, "code_attempt0.py",
-    )
-    if not os.path.exists(src) or os.path.getsize(src) == 0:
+    src = eval_modes.latest_oneshot_attempt(paper_id, short)
+    if src is None:
         return None
     os.makedirs(seed_dir, exist_ok=True)
     dst = os.path.join(seed_dir, "code.py")
@@ -491,7 +506,12 @@ def run_self_evolve(
 
     oe_run_dir = os.path.join(base_dir, "openevolve_run")
     oe_config_path = os.path.join(base_dir, "openevolve_config.yaml")
-    write_openevolve_config(oe_config_path, primary_model, secondary_model)
+    write_openevolve_config(
+        oe_config_path,
+        primary_model,
+        secondary_model,
+        api_base=config.get("LLM_API_BASE"),
+    )
     evaluator_path = os.path.join(ROOT_DIR, "test_time_self_evolution", "openevolve", "evaluator.py")
     if resume and resume_remaining_iters == 0:
         # Already at or past the target budget — skip evolution entirely.

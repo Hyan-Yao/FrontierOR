@@ -2683,5 +2683,9 @@
     "avg_num_int_var": 325570.0,
     "avg_num_constr": 15434.0,
     "source_link": "https://doi.org/10.1287/ijoc.2020.1015"
+  },
+  {
+    "paper_id": "ostrowski2012",
+    "direction": "min"
   }
 ]

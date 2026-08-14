@@ -42,10 +42,31 @@ def load_mode_config():
     if os.path.exists(keys_path):
         with open(keys_path, encoding="utf-8") as f:
             keys = yaml.safe_load(f) or {}
-    api_key = os.environ.get("OPENROUTER_API_KEY") or keys.get("OPENROUTER_API_KEY_SELF_EVOLVE")
-    if not api_key:
-        raise SystemExit("ERROR: set env OPENROUTER_API_KEY or OPENROUTER_API_KEY_SELF_EVOLVE in configs/api_keys.yaml")
-    config["OPENROUTER_API_KEY"] = api_key
+    openai_key = os.environ.get("OPENAI_API_KEY")
+    openrouter_key = (
+        os.environ.get("OPENROUTER_API_KEY")
+        or keys.get("OPENROUTER_API_KEY_SELF_EVOLVE")
+    )
+    if openai_key:
+        config["LLM_API_PROVIDER"] = "openai_compatible"
+        config["LLM_API_KEY"] = openai_key
+        config["LLM_API_BASE"] = (
+            os.environ.get("OPENAI_BASE_URL")
+            or os.environ.get("OPENAI_API_BASE")
+            or "https://api.openai.com/v1"
+        )
+        config["OPENAI_API_KEY"] = openai_key
+    elif openrouter_key:
+        config["LLM_API_PROVIDER"] = "openrouter"
+        config["LLM_API_KEY"] = openrouter_key
+        config["LLM_API_BASE"] = "https://openrouter.ai/api/v1"
+        # Keep the legacy key for one-shot generation and older adapters.
+        config["OPENROUTER_API_KEY"] = openrouter_key
+    else:
+        raise SystemExit(
+            "ERROR: set OPENAI_API_KEY, OPENROUTER_API_KEY, or "
+            "OPENROUTER_API_KEY_SELF_EVOLVE in configs/api_keys.yaml"
+        )
     if not config.get("models"):
         if config.get("model"):
             config["models"] = [config["model"]]
@@ -75,10 +96,15 @@ def resolve_model_id(config, ref):
     all_models = config["models"]
     by_short = {eval_core.get_model_short_name(m): m for m in all_models}
     if ref in by_short:
-        return by_short[ref]
+        resolved = by_short[ref]
+        # OpenAI-compatible endpoints can expose native model IDs instead of
+        # OpenRouter's vendor-prefixed routes (for example
+        # ``qwen3-coder-plus`` rather than ``qwen/qwen3-coder-plus``).  Keep
+        # self-evolution consistent with one-shot request normalization.
+        return eval_core._endpoint_model_id(config, resolved)
     if ref not in all_models:
         print(f"WARNING: '{ref}' not listed in configs/oneshot.yaml models; using as-is.")
-    return ref
+    return eval_core._endpoint_model_id(config, ref)
 
 
 def build_prompt(paper_id):
@@ -103,7 +129,11 @@ def run_per_model_modes(args, run_id, config, paper_id, model, prompt):
         "instances": args.instances,
         "time_limit": args.time_limit,
         "exec_mode": args.exec_mode,
-        "exec_cfg": {"cpus": args.cpus, "memory": args.memory},
+        "exec_cfg": {
+            "cpus": args.cpus,
+            "memory": args.memory,
+            "memory_reserve": args.memory_reserve,
+        },
         "t_max": args.t_max,
     }
     results = {}
@@ -170,15 +200,24 @@ def _resolve_dev_set_for_paper(paper_id: str, dev_set_arg):
         print(f"  [dev-set auto] {paper_id} → {picked} (max τ_g)")
         return [picked]
     if dev_set_arg == [_DEV_SET_SENTINEL_MEDIAN]:
-        from test_time_self_evolution.scoring.building_blocks import pick_median_tau_g_instance
+        from test_time_self_evolution.scoring.building_blocks import (
+            lookup_gurobi_time,
+            pick_median_tau_g_instance,
+        )
         picked = pick_median_tau_g_instance(paper_id)
         if not picked:
             raise SystemExit(
                 f"ERROR: cannot auto-pick --dev-set (median) for paper '{paper_id}' "
-                f"(no large_* instances on disk, or no Gurobi τ_g recorded for any). "
+                f"(no large_* instances on disk). "
                 f"Pass --dev-set explicitly."
             )
-        print(f"  [dev-set auto] {paper_id} → {picked} (median τ_g)")
+        if lookup_gurobi_time(paper_id, picked) is None:
+            print(
+                f"  [dev-set auto] {paper_id} → {picked} "
+                "(median instance-number fallback; no large-instance τ_g recorded)"
+            )
+        else:
+            print(f"  [dev-set auto] {paper_id} → {picked} (median τ_g)")
         return [picked]
     # Explicit list
     return list(dev_set_arg)
@@ -298,7 +337,11 @@ def _resolve_coral_max_seconds(args, paper_id: str, dev_set):
 
 def run_self_evolve_mode(args, run_id, config, paper_id, prompt, primary_model, secondary_model):
     dev_set = _resolve_dev_set_for_paper(paper_id, args.stage2_instances)
-    test_set = _resolve_test_set_for_paper(paper_id, args.test_instances, dev_set)
+    test_set = (
+        list(args.test_instances)
+        if args.fixed_test_set
+        else _resolve_test_set_for_paper(paper_id, args.test_instances, dev_set)
+    )
     common = {
         "run_id": run_id,
         "paper_id": paper_id,
@@ -314,7 +357,11 @@ def run_self_evolve_mode(args, run_id, config, paper_id, prompt, primary_model, 
         "test_time_limit": args.test_time_limit,
         "stage1_gap_threshold": args.stage1_gap_threshold,
         "exec_mode": args.exec_mode,
-        "exec_cfg": {"cpus": args.cpus, "memory": args.memory},
+        "exec_cfg": {
+            "cpus": args.cpus,
+            "memory": args.memory,
+            "memory_reserve": args.memory_reserve,
+        },
         "t_max": args.t_max,
         "stage2_scorer": args.stage2_scorer,
         "stage2_stage_boundary": args.stage2_stage_boundary,
@@ -482,6 +529,10 @@ def parse_args():
                              "Empty → skip the post-evolve eval and reconstruct per-instance "
                              "rows for the dev results CSV from OpenEvolve's checkpoint. "
                              "Aliases: --test_set, --test-instances.")
+    parser.add_argument("--fixed-test-set", action="store_true",
+                        help="Use --test-set exactly as supplied, including any overlap with "
+                             "the auto-selected dev instance. This is intended for frozen "
+                             "benchmark manifests that require a stable test grid.")
     parser.add_argument("--stage1-time-limit", type=int, default=300,
                         help="Per-instance time limit (s) for stage1 (tiny gate). "
                              "Preset: 300.")
@@ -562,12 +613,13 @@ def parse_args():
                              "--cpus cores (via taskset + cgroup), preventing multi-thread "
                              "fitness cheats. Use 'bare' only for debugging; it has no CPU limits.")
     parser.add_argument("--cpus", type=int, default=1)
-    parser.add_argument("--memory", default="640G",
-                        help="cgroup memory hard cap per candidate subprocess (systemd "
-                             "exec mode). Default 640G — sized for 112-CPU server with ~1TB "
-                             "RAM. Lower this if your machine has less memory; the cap is "
-                             "a defensive ceiling against LLM-generated code that allocates "
-                             "unbounded arrays, not the typical solver footprint.")
+    parser.add_argument("--memory", default="16G",
+                        help="Per-candidate memory limit. Bubblewrap enforces RLIMIT_AS; "
+                             "systemd/docker use cgroups/container limits. Default: 16G.")
+    parser.add_argument("--memory-reserve", default="16G",
+                        help="Bubblewrap admission guard: keep at least this much host "
+                             "MemAvailable unreserved for other programs. Default: 16G. "
+                             "Use 0 only on a dedicated machine.")
     from one_shot_eval import parse_t_max as _parse_t_max
     parser.add_argument("--t_max", type=_parse_t_max, default=None,
                         help="AOCC horizon. Float (seconds) or 'gurobi' for "
@@ -713,6 +765,18 @@ def main():
             return paper_id, "failed", f"{type(e).__name__}: {e}"
 
     n_paper_workers = max(1, args.paper_workers)
+    # EoH installs process-global runtime patches and its benchmark adapter
+    # temporarily communicates the active paper through os.environ. Running
+    # two papers in the same ThreadPoolExecutor can therefore cross-wire a
+    # candidate with another paper's schemas/instances. Keep paper-level EoH
+    # execution serial; offspring-level parallelism remains controlled by
+    # --eoh-workers.
+    if args.framework == "eoh" and n_paper_workers > 1:
+        print(
+            "\n[paper-pool] EoH uses process-global patches/environment; "
+            f"forcing --paper-workers 1 (requested {n_paper_workers})"
+        )
+        n_paper_workers = 1
     if n_paper_workers <= 1 or len(paper_ids) <= 1:
         statuses = [_process_paper(pid) for pid in paper_ids]
     else:

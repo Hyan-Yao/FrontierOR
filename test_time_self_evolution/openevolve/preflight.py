@@ -18,6 +18,7 @@ import os
 import subprocess
 import sys
 from typing import Dict, List, Optional
+from urllib.parse import quote, urlparse
 
 import one_shot_eval as eval_core
 
@@ -104,35 +105,48 @@ def _check_gurobi_time_required(
     return issues
 
 
-def _check_openrouter_key(config: Dict, primary_model: str) -> List[str]:
-    """Verify an API key is configured and (best-effort) authorizes against
-    OpenRouter's /api/v1/key endpoint. Set ``EFFICIENT_OR_SKIP_NETWORK_PREFLIGHT=1``
-    to skip the HTTP probe (offline mode). Network/transient errors warn-only;
-    only HTTP 401/403 (definitive auth rejection) blocks the run.
+def _check_llm_api_key(config: Dict, primary_model: str) -> List[str]:
+    """Verify the configured OpenAI/OpenRouter key with a read-only probe.
+
+    Set ``EFFICIENT_OR_SKIP_NETWORK_PREFLIGHT=1`` to skip the HTTP probe.
+    Network/transient errors warn only; definitive 401/403 responses block.
     """
     issues: List[str] = []
-    key = config.get("OPENROUTER_API_KEY") if isinstance(config, dict) else None
+    provider = config.get("LLM_API_PROVIDER", "openrouter")
+    key = config.get("LLM_API_KEY") or config.get("OPENROUTER_API_KEY")
     if not key:
-        issues.append(f"openrouter_key: not configured for model={primary_model!r}")
+        issues.append(f"llm_api_key: not configured for model={primary_model!r}")
         return issues
     if os.environ.get("EFFICIENT_OR_SKIP_NETWORK_PREFLIGHT") == "1":
         return issues
     try:
         import http.client
-        conn = http.client.HTTPSConnection("openrouter.ai", timeout=10)
-        conn.request("GET", "/api/v1/key", headers={"Authorization": f"Bearer {key}"})
+        if provider in {"openai", "openai_compatible"}:
+            parsed = urlparse(config.get("LLM_API_BASE", "https://api.openai.com/v1"))
+            host = parsed.netloc or "api.openai.com"
+            base_path = (parsed.path or "/v1").rstrip("/")
+            path = f"{base_path}/models/{quote(primary_model, safe='')}"
+        else:
+            host = "openrouter.ai"
+            path = "/api/v1/key"
+        conn = http.client.HTTPSConnection(host, timeout=10)
+        conn.request("GET", path, headers={"Authorization": f"Bearer {key}"})
         resp = conn.getresponse()
         resp.read()
         conn.close()
         if resp.status in (401, 403):
             issues.append(
-                f"openrouter_key: HTTP {resp.status} {resp.reason} — key invalid or expired"
+                f"llm_api_key: HTTP {resp.status} {resp.reason} — key invalid or expired"
+            )
+        elif provider in {"openai", "openai_compatible"} and resp.status == 404:
+            issues.append(
+                f"llm_model: {primary_model!r} is unavailable to this OpenAI project"
             )
         elif resp.status != 200:
-            print(f"[preflight] WARNING: OpenRouter probe returned HTTP {resp.status} "
+            print(f"[preflight] WARNING: {provider} probe returned HTTP {resp.status} "
                   f"{resp.reason}; continuing (likely transient).")
     except Exception as e:
-        print(f"[preflight] WARNING: OpenRouter probe failed "
+        print(f"[preflight] WARNING: {provider} API probe failed "
               f"({type(e).__name__}: {str(e)[:80]}); continuing (network may be down). "
               f"Set EFFICIENT_OR_SKIP_NETWORK_PREFLIGHT=1 to silence.")
     return issues
@@ -214,7 +228,7 @@ def preflight_environment_check(
         paper_id, stage2_instances, test_instances,
         stage2_time_policy, test_time_policy, stage2_scorer,
     )
-    issues += _check_openrouter_key(config, primary_model)
+    issues += _check_llm_api_key(config, primary_model)
     issues += _check_gurobi_license()
 
     if issues:
